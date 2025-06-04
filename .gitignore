@@ -49,4 +49,8 @@ __pycache__/
 # Azurite artifacts
 __blobstorage__
 __queuestorage__
+<<<<<<< HEAD
+__azurite_db*__.jsonserver.log
+=======
 __azurite_db*__.json
+>>>>>>> 6d5f358f736c80c52728d01acea7e89c1554becd
