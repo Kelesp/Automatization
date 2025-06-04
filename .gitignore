@@ -24,7 +24,6 @@ local.settings.json
 
 node_modules
 dist
-server.log
 
 #ignorar log de servidor
 server.log
