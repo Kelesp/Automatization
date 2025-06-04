@@ -2,17 +2,15 @@
 
 import os
 import time
-import json
 import tempfile
-from typing import List, Dict
+import json
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-import fitz  # PyMuPDF
-from PIL import Image
 import pytesseract
-
+from PIL import Image
+import fitz   # PyMuPDF
 import openai
 
 # ------------------------------------------------------------
@@ -20,7 +18,7 @@ import openai
 # ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-RUTA_TXT_CUIDADO = os.path.join(BASE_DIR, "politicas_txt", "politica_cuidado.txt")
+RUTA_TXT_CUIDADO       = os.path.join(BASE_DIR, "politicas_txt", "politica_cuidado.txt")
 RUTA_TXT_ENVEJECIMIENTO = os.path.join(BASE_DIR, "politicas_txt", "politica_envejecimiento.txt")
 
 try:
@@ -42,13 +40,13 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise RuntimeError("No se encontró la variable de entorno OPENAI_API_KEY")
 
-# Si usas Windows, ajusta la ruta de tesseract:
+# En Windows, ajusta la ruta a tesseract.exe si es necesario:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 app = FastAPI(
     title="API de Extracción y Clasificación de Párrafos Relevantes",
-    description="Recibe un PDF de municipio, extrae párrafos y genera resumen y clasificación.",
-    version="2.0",
+    description="Recibe un PDF, extrae párrafos, genera resumen e indicadores de alineación con políticas.",
+    version="1.0",
 )
 
 app.add_middleware(
@@ -60,42 +58,32 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------
-# 2) Función de utilidad: contar cuántas páginas tiene un PDF
+# 2) Función de utilidad: contar páginas del PDF
 # ------------------------------------------------------------
 def contar_paginas_pdf(path: str) -> int:
-    """
-    Abre el PDF en la ruta 'path' y devuelve su cantidad total de páginas.
-    """
-    try:
-        with fitz.open(path) as doc:
-            total = len(doc)
-        return total
-    except Exception as e:
-        raise RuntimeError(f"Error al abrir el PDF para contar páginas: {e}")
+    """ Devuelve el número de páginas que tiene el PDF en disco """
+    with fitz.open(path) as doc:
+        total = len(doc)
+    return total
 
 # ------------------------------------------------------------
-# 3) Función de utilidad: extraer texto de páginas dadas
+# 3) Función de utilidad: extraer texto del PDF (OCR o nativo)
 # ------------------------------------------------------------
-def extract_text_from_pdf(
-    path: str,
-    pagina_inicio: int,
-    pagina_fin: int
-) -> str:
+def extract_text_from_pdf(path: str, pagina_inicio: int, pagina_fin: int) -> str:
     """
-    Extrae texto nativo de PDF en el rango [pagina_inicio, pagina_fin].
-    Si la página está vacía, aplica OCR con pytesseract.
+    Extrae texto de cada página en el rango [pagina_inicio..pagina_fin].
+    Si la página no tiene texto simple, intenta OCR.
     """
-    texto_total: List[str] = []
+    texto_total = []
     with fitz.open(path) as doc:
-        primero = max(pagina_inicio - 1, 0)
-        ultimo = min(len(doc), pagina_fin) - 1
+        primero = pagina_inicio - 1
+        ultimo  = pagina_fin - 1
         for num_pag in range(primero, ultimo + 1):
             page = doc[num_pag]
             txt = page.get_text().strip()
             if txt:
                 texto_total.append(f"--- Página {num_pag+1} (texto nativo) ---\n{txt}\n")
             else:
-                # Si no hay texto nativo, aplicamos OCR
                 try:
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -106,21 +94,73 @@ def extract_text_from_pdf(
     return "\n".join(texto_total)
 
 # ------------------------------------------------------------
-# 4) Función de utilidad: llamar a OpenAI para extraer párrafos
+# 4) Endpoint principal: /process_pdf/
 # ------------------------------------------------------------
-def llamar_openai_para_parrafos(
-    texto_a_analizar: str,
-    municipio: str,
-    pagina_inicio: int,
-    pagina_fin: int
-) -> List[Dict]:
-    """
-    Manda el prompt a OpenAI (gpt-4o-mini) para extraer párrafos relevantes
-    dentro de texto_a_analizar. Devuelve LISTA de objetos con keys:
-      - "pagina", "parrafo", "tema", "resumen", "relevancia"
-    Si falla el parseo JSON, devuelve lista vacía.
-    """
-    prompt = f"""
+@app.post("/process_pdf/")
+async def process_pdf(
+    file: UploadFile = File(..., description="Archivo PDF de municipio"),
+    municipio: str   = Form(..., description="Nombre del municipio"),
+    pagina_inicio: int = Form(..., description="Página inicial (1-based)"),
+    pagina_fin:    int = Form(..., description="Página final (1-based)"),
+):
+    # --- 4.1) Validaciones iniciales ---
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
+    if pagina_inicio < 1 or pagina_fin < pagina_inicio:
+        raise HTTPException(status_code=400, detail="Rango de páginas inválido")
+
+    # Limpio posibles '\n' o espacios extra en el nombre del municipio
+    municipio = municipio.strip()
+    print(f"[{time.strftime('%H:%M:%S')}] Recibido PDF para municipio: '{municipio}', páginas {pagina_inicio} a {pagina_fin}")
+
+    # --- 4.2) Guardar PDF de municipio en un temporal ---
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            contenido = await file.read()
+            tmp.write(contenido)
+            tmp_path = tmp.name
+        print(f"[{time.strftime('%H:%M:%S')}] PDF guardado en temporal: {tmp_path}")
+    except Exception as e_save:
+        raise HTTPException(status_code=500, detail=f"Error al guardar archivo temporal: {e_save}")
+
+    # --- 4.3) Contar cuántas páginas tiene el PDF ---
+    try:
+        total_paginas = contar_paginas_pdf(tmp_path)
+        print(f"[{time.strftime('%H:%M:%S')}] El PDF tiene {total_paginas} páginas.")
+    except Exception as e_contar:
+        os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail=f"Error al contar páginas: {e_contar}")
+
+    # --- 4.4) Ajustar pagina_fin al número real de páginas ---
+    pagina_fin_real = min(pagina_fin, total_paginas)
+    print(f"[{time.strftime('%H:%M:%S')}] Ajustado pagina_fin de {pagina_fin} a {pagina_fin_real}")
+
+    # --- 4.5) Extraer texto por lotes de 50 páginas (o menos) ---
+    lotes = []
+    lote_inicio = pagina_inicio
+    lote_tamano = 50
+
+    while lote_inicio <= pagina_fin_real:
+        lote_fin = min(lote_inicio + lote_tamano - 1, pagina_fin_real)
+        lotes.append((lote_inicio, lote_fin))
+        lote_inicio = lote_fin + 1
+
+    print(f"[{time.strftime('%H:%M:%S')}] Se van a procesar los siguientes lotes de páginas: {lotes}")
+
+    resultados_parrafos_todos = []
+    resumenes_parciales = []
+
+    for idx, (ini, fin) in enumerate(lotes, start=1):
+        print(f"[{time.strftime('%H:%M:%S')}] Lote {idx}/{len(lotes)}: Extrayendo texto de páginas {ini} a {fin} ...")
+        try:
+            texto_lote = extract_text_from_pdf(tmp_path, ini, fin)
+            print(f"[{time.strftime('%H:%M:%S')}] Terminé extracción de texto (lote {idx}) de páginas {ini} a {fin}.")
+        except Exception as e_ext:
+            os.remove(tmp_path)
+            raise HTTPException(status_code=500, detail=f"Error al extraer texto del PDF (lote {idx}): {e_ext}")
+
+        # --- 4.6) Llamada a OpenAI para extraer párrafos relevantes del lote actual ---
+        prompt_parrafos = f"""
 Eres un asistente que extrae párrafos relevantes de documentos de planeación territorial.
 Busca párrafos que contengan cualquiera de los siguientes temas (en español):
 - Personas mayores
@@ -133,7 +173,7 @@ Busca párrafos que contengan cualquiera de los siguientes temas (en español):
 - Caracterización de cuidadores o personas cuidadoras
 
 Para cada párrafo que encuentres, genera un objeto JSON con estos campos exactos:
-  - "pagina": número de página (1-based)
+  - "pagina": número de página (1-based)  ←   Nota: suma ini-1 si quieres la numeración real
   - "parrafo": texto completo del párrafo
   - "tema": cuál de los temas detectaste
   - "resumen": breve resumen (1–2 líneas) del párrafo
@@ -142,104 +182,90 @@ Para cada párrafo que encuentres, genera un objeto JSON con estos campos exacto
 **Devuelve únicamente un ARRAY JSON (puede estar vacío) sin texto extra, ni explicaciones, ni backticks.**
 
 Municipio: {municipio}
-Rango de páginas: {pagina_inicio} a {pagina_fin}
+Rango de páginas de este lote: {ini} a {fin}
 
 Texto a analizar:
-\"\"\"
-{texto_a_analizar}
-\"\"\"
+\"\"\"{texto_lote}\"\"\"
 """
-    print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para extraer párrafos (páginas {pagina_inicio}-{pagina_fin})…")
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=2500  # suficiente para devolver JSON de párrafos
-        )
-        respuesta_texto = resp.choices[0].message.content.strip()
-        # Limpiar triple backticks si viniera envuelto en ```json ... ```
-        if respuesta_texto.startswith("```") and respuesta_texto.endswith("```"):
-            lines = respuesta_texto.splitlines()
+        print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para extraer párrafos relevantes (lote {idx})...")
+        try:
+            response1 = openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt_parrafos}],
+                temperature=0.0,
+                max_tokens=2000
+            )
+            response_text1 = response1.choices[0].message.content.strip()
+            print(f"[{time.strftime('%H:%M:%S')}] Respuesta OpenAI (párrafos, lote {idx}) recibida (duró ~{response1.usage.total_tokens/1000:.1f}k tokens).")
+        except openai.error.OpenAIError as e_openai:
+            os.remove(tmp_path)
+            raise HTTPException(status_code=500, detail=f"Error en llamada a OpenAI (párrafos, lote {idx}): {e_openai}")
+
+        # Eliminar posibles backticks
+        if response_text1.startswith("```") and response_text1.endswith("```"):
+            lines = response_text1.splitlines()
             if len(lines) >= 3:
-                respuesta_texto = "\n".join(lines[1:-1]).strip()
+                response_text1 = "\n".join(lines[1:-1]).strip()
 
-        resultados = json.loads(respuesta_texto)
-        print(f"[{time.strftime('%H:%M:%S')}] Respuesta párrafos recibida (páginas {pagina_inicio}-{pagina_fin}).")
-        return resultados
+        # Intentar parsear JSON de párrafos
+        try:
+            lista_parrafos_lote = json.loads(response_text1)
+        except json.JSONDecodeError:
+            lista_parrafos_lote = []
+            print(f"[{time.strftime('%H:%M:%S')}] ¡Advertencia! No se pudo parsear JSON de párrafos en lote {idx}. Raw:\n{response_text1[:300]}...")
 
-    except openai.error.OpenAIError as oe:
-        print(f"[{time.strftime('%H:%M:%S')}] ERROR en ChatCompletion (párrafos): {oe}")
-        return []
-    except json.JSONDecodeError as je:
-        print(f"[{time.strftime('%H:%M:%S')}] ERROR al parsear JSON de párrafos: {je}\nRaw:\n{respuesta_texto}")
-        return []
+        # Ajustar número de página real por cada párrafo
+        for par in lista_parrafos_lote:
+            # Si el asistente devolvió "pagina" relativa al lote (ej: 1..(fin-ini+1)), ajustamos así:
+            pag_rel = par.get("pagina", None)
+            if isinstance(pag_rel, int):
+                par["pagina"] = pag_rel + (ini - 1)
+            resultados_parrafos_todos.append(par)
+            resumen_par = par.get("resumen", "").strip()
+            if resumen_par:
+                resumenes_parciales.append(resumen_par)
 
-# ------------------------------------------------------------
-# 5) Función de utilidad: llamar a OpenAI para generar resumen general
-# ------------------------------------------------------------
-def llamar_openai_para_resumen_general(resumenes_parciales: List[str]) -> str:
-    """
-    A partir de una lista de resúmenes parciales (1–2 líneas por párrafo),
-    genera un resumen general (2–3 párrafos).
-    Si no hay resúmenes parciales, devuelve un texto indicando que no hay.
-    """
-    if not resumenes_parciales:
-        return "No hay resúmenes parciales para generar un Resumen General."
-
-    bloque = "\n".join(f"- {r}" for r in resumenes_parciales if r)
-    prompt = f"""
-A partir de estos resúmenes parciales (cada línea corresponde a un resumen breve de un párrafo):
-{bloque}
+    # 4.7) Generar Resumen General a partir de todos los resúmenes parciales
+    resumen_general = ""
+    if resumenes_parciales:
+        bloque_resumenes = "\n".join(f"- {r}" for r in resumenes_parciales)
+        prompt_resumen = f"""
+A partir de estos resúmenes parciales (cada línea corresponde a un breve resumen de un párrafo):
+{bloque_resumenes}
 
 Genera un Resumen General coherente (2–3 párrafos) que sintetice las ideas principales de todos los resúmenes anteriores.
 Devuelve únicamente el texto del Resumen General, sin encabezados ni formato extra.
 """
-    print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para generar Resumen General…")
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=1500
-        )
-        resumen = resp.choices[0].message.content.strip()
-        print(f"[{time.strftime('%H:%M:%S')}] Resumen General recibido.")
-        return resumen
-    except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ERROR en generar Resumen General: {e}")
-        return f"Error al generar Resumen General: {e}"
-
-# ------------------------------------------------------------
-# 6) Función de utilidad: clasificar alineación con políticas
-# ------------------------------------------------------------
-def llamar_openai_para_clasificacion(
-    texto_politica: str,
-    nombre_politica: str,
-    resumen_general: str
-) -> Dict:
-    """
-    Dado el texto completo de una política (texto_politica),
-    y el resumen general (resumen_general), envía un prompt a OpenAI
-    (model: gpt-3.5-turbo) para evaluar la alineación y extraer objetivos.
-    Devuelve un diccionario con { "alineacion": "alta|media|baja", "objetivos_alineados": [ ... ] }.
-    """
-    # Si el texto de la política es demasiado largo, podríamos recortarlo a los primeros N caracteres:
-    if len(texto_politica) > 4000:
-        texto_cortado = texto_politica[:4000] + "\n…(texto recortado para clasificación)…"
+        print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para generar Resumen General...")
+        try:
+            resp2 = openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt_resumen}],
+                temperature=0.0,
+                max_tokens=1000
+            )
+            resumen_general = resp2.choices[0].message.content.strip()
+            print(f"[{time.strftime('%H:%M:%S')}] Resumen General recibido.")
+        except Exception as e_resumen:
+            resumen_general = f"Error al generar Resumen General: {e_resumen}"
+            print(f"[{time.strftime('%H:%M:%S')}] ¡Error generando Resumen General!: {e_resumen}")
     else:
-        texto_cortado = texto_politica
+        resumen_general = "No hay resúmenes parciales para generar un Resumen General."
+        print(f"[{time.strftime('%H:%M:%S')}] No había párrafos para resumir. El Resumen General quedó vacío.")
 
-    prompt = f"""
-Eres un experto en políticas públicas de {nombre_politica}. A continuación se te proporciona:
-1) Fragmento relevante de la política (formato plano, sin formato adicional):
-\"\"\"\n{texto_cortado}\n\"\"\"
+    # 4.8) Clasificar alineación contra Política de Cuidado
+    clasificacion_cuidado = {}
+    try:
+        prompt_cuidado = f"""
+Eres un experto en políticas públicas de cuidado. A continuación se te proporciona:
+1) Texto completo de la Política Nacional de Cuidado (secciones relevantes, formato plano):
+\"\"\"\n{TEXT_CUIDADO}\n\"\"\"
 
-2) Resumen General del municipio:
+2) Resumen General del municipio «{municipio}»:
 \"\"\"\n{resumen_general}\n\"\"\"
 
-A. Evalúa el nivel de ALINEACIÓN entre el Resumen General y la política. Clasifica en uno de ["alta", "media", "baja"].
-B. Especifica con qué objetivos de la política se alinea (por ejemplo: "Objetivo 1", "Objetivo 2", etc.).
+A. Evalúa el nivel de ALINEACIÓN entre el Resumen General y la Política Nacional de Cuidado. Clasifica en uno de ["alta", "media", "baja"].
+B. Especifica con qué objetivos de la política de cuidado se alinea el Resumen General (por ejemplo: "Objetivo 1", "Objetivo 2", etc.).
 
 Devuelve únicamente un JSON con este formato:
 {{ 
@@ -248,142 +274,83 @@ Devuelve únicamente un JSON con este formato:
 }}
 Sin texto adicional ni explicaciones.
 """
-
-    print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para clasificar {nombre_politica}…")
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+        print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para clasificar alineación con Política de Cuidado...")
+        resp3 = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt_cuidado}],
             temperature=0.0,
-            max_tokens=800
+            max_tokens=500
         )
-        text = resp.choices[0].message.content.strip()
-        # Limpiar backticks
-        if text.startswith("```") and text.endswith("```"):
-            lines = text.splitlines()
+        text3 = resp3.choices[0].message.content.strip()
+        if text3.startswith("```") and text3.endswith("```"):
+            lines = text3.splitlines()
             if len(lines) >= 3:
-                text = "\n".join(lines[1:-1]).strip()
+                text3 = "\n".join(lines[1:-1]).strip()
+        clasificacion_cuidado = json.loads(text3)
+        print(f"[{time.strftime('%H:%M:%S')}] Clasificación Cuidado recibida.")
+    except Exception as e_cu:
+        clasificacion_cuidado = {"error": f"No se pudo clasificar Cuidado: {e_cu}"}
+        print(f"[{time.strftime('%H:%M:%S')}] ¡Error clasificando Cuidado!: {e_cu}")
 
-        resultado = json.loads(text)
-        print(f"[{time.strftime('%H:%M:%S')}] Clasificación {nombre_politica} recibida.")
-        return resultado
-    except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ERROR al clasificar {nombre_politica}: {e}")
-        return {"alineacion": "error", "objetivos_alineados": [], "error": str(e)}
-
-# ------------------------------------------------------------
-# 7) Endpoint principal: /process_pdf/
-# ------------------------------------------------------------
-@app.post("/process_pdf/")
-async def process_pdf(
-    file: UploadFile = File(..., description="Archivo PDF de municipio"),
-    municipio: str = Form(..., description="Nombre del municipio"),
-    pagina_inicio: int = Form(..., description="Página inicial (1-based)"),
-    pagina_fin: int = Form(..., description="Página final (1-based)")
-):
-    # 1) Validaciones básicas
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
-    if pagina_inicio < 1 or pagina_fin < pagina_inicio:
-        raise HTTPException(status_code=400, detail="Rango de páginas inválido")
-
-    # 2) Guardar PDF en un archivo temporal
+    # 4.9) Clasificar alineación contra Política de Envejecimiento
+    clasificacion_envejecimiento = {}
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            contenido = await file.read()
-            tmp.write(contenido)
-            tmp_path = tmp.name
-        print(f"[{time.strftime('%H:%M:%S')}] PDF guardado en temporal: {tmp_path}")
-    except Exception as e_save:
-        raise HTTPException(status_code=500, detail=f"Error al guardar archivo temporal: {e_save}")
+        prompt_envejecimiento = f"""
+Eres un experto en políticas de envejecimiento y vejez. A continuación:
+1) Texto completo de la Política Nacional de Envejecimiento y Vejez:
+\"\"\"\n{TEXT_ENVEJECIMIENTO}\n\"\"\"
 
-    # 3) Contar cuántas páginas tiene el PDF
-    try:
-        total_paginas = contar_paginas_pdf(tmp_path)
-        print(f"[{time.strftime('%H:%M:%S')}] El PDF tiene {total_paginas} páginas.")
-    except Exception as e_contar:
-        os.remove(tmp_path)
-        raise HTTPException(status_code=500, detail=f"Error al contar páginas: {e_contar}")
+2) Resumen General del municipio «{municipio}»:
+\"\"\"\n{resumen_general}\n\"\"\"
 
-    # 4) Ajustar el rango final si supera el total
-    pagina_fin_real = min(pagina_fin, total_paginas)
+A. Evalúa el nivel de ALINEACIÓN entre el Resumen General y la Política Nacional de Envejecimiento y Vejez. Clasifica en uno de ["alta", "media", "baja"].
+B. Especifica con qué objetivos de la política de envejecimiento se alinea el Resumen General (por ejemplo: "Objetivo 1", "Objetivo 2", etc.).
 
-    # 5) Log
-    print(f"[{time.strftime('%H:%M:%S')}] Procesando municipio '{municipio}' de página {pagina_inicio} a {pagina_fin_real}...")
+Devuelve únicamente un JSON con este formato:
+{{ 
+  "alineacion": "alta|media|baja",
+  "objetivos_alineados": ["Objetivo X", "Objetivo Y", …]
+}}
+Sin texto adicional ni explicaciones.
+"""
+        print(f"[{time.strftime('%H:%M:%S')}] Enviando prompt a OpenAI para clasificar alineación con Política de Envejecimiento...")
+        resp4 = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt_envejecimiento}],
+            temperature=0.0,
+            max_tokens=500
+        )
+        text4 = resp4.choices[0].message.content.strip()
+        if text4.startswith("```") and text4.endswith("```"):
+            lines = text4.splitlines()
+            if len(lines) >= 3:
+                text4 = "\n".join(lines[1:-1]).strip()
+        clasificacion_envejecimiento = json.loads(text4)
+        print(f"[{time.strftime('%H:%M:%S')}] Clasificación Envejecimiento recibida.")
+    except Exception as e_en:
+        clasificacion_envejecimiento = {"error": f"No se pudo clasificar Envejecimiento: {e_en}"}
+        print(f"[{time.strftime('%H:%M:%S')}] ¡Error clasificando Envejecimiento!: {e_en}")
 
-    # 6) Dividir en lotes de, por ejemplo, 50 páginas cada uno
-    LOTE_SIZE = 50
-    rangos_lotes = []
-    pag_act = pagina_inicio
-    while pag_act <= pagina_fin_real:
-        fin_lote = min(pag_act + LOTE_SIZE - 1, pagina_fin_real)
-        rangos_lotes.append((pag_act, fin_lote))
-        pag_act = fin_lote + 1
-
-    resultados_todos_lotes: List[Dict] = []
-
-    # 7) Iterar lote por lote
-    for (ini, fin) in rangos_lotes:
-        print(f"[{time.strftime('%H:%M:%S')}] → Procesando lote páginas {ini} a {fin}…")
-
-        # 7.1) Extraer texto de ese lote
-        t0 = time.time()
-        try:
-            texto_parcial = extract_text_from_pdf(tmp_path, ini, fin)
-            dur = time.time() - t0
-            print(f"[{time.strftime('%H:%M:%S')}] ---- Texto extraído (lote {ini}-{fin}) en {dur:.1f}s.")
-        except Exception as e_ext:
-            os.remove(tmp_path)
-            raise HTTPException(status_code=500, detail=f"Error al extraer texto (lote {ini}-{fin}): {e_ext}")
-
-        # 7.2) Llamar a OpenAI para extraer párrafos
-        resultados_parciales = llamar_openai_para_parrafos(texto_parcial, municipio, ini, fin)
-        # Nos quedamos sólo con la lista, en caso de que venga None o string, forzamos lista vacía
-        if not isinstance(resultados_parciales, list):
-            resultados_parciales = []
-
-        # 7.3) Agregar esos resultados parciales al arreglo global
-        resultados_todos_lotes.extend(resultados_parciales)
-
-    # 8) Ya acumulamos todos los párrafos de todos los lotes, por tanto ahora generamos el resumen general
-    lista_resumenes = [item.get("resumen", "").strip() for item in resultados_todos_lotes if isinstance(item, dict)]
-    resumen_general = llamar_openai_para_resumen_general(lista_resumenes)
-
-    # 9) Clasificación con Política de Cuidado y Envejecimiento (usamos gpt-3.5-turbo)
-    clasificacion_cuidado = llamar_openai_para_clasificacion(
-        texto_politica=TEXT_CUIDADO,
-        nombre_politica="Cuidado",
-        resumen_general=resumen_general
-    )
-    clasificacion_envejecimiento = llamar_openai_para_clasificacion(
-        texto_politica=TEXT_ENVEJECIMIENTO,
-        nombre_politica="Envejecimiento",
-        resumen_general=resumen_general
-    )
-
-    # 10) Borrar el temporal
+    # 4.10) Limpiar archivo temporal del municipio
     try:
         os.remove(tmp_path)
         print(f"[{time.strftime('%H:%M:%S')}] Archivo temporal eliminado: {tmp_path}")
-    except:
+    except Exception:
         pass
 
-    # 11) Construir respuesta final
+    # 4.11) Devolver la respuesta completa
     return {
-        "municipio": municipio.strip(),
+        "municipio": municipio,
         "pagina_inicio": pagina_inicio,
         "pagina_fin": pagina_fin_real,
-        "resultados_parrafos": resultados_todos_lotes,
+        "resultados_parrafos": resultados_parrafos_todos,
         "resumen_general": resumen_general,
         "clasificacion_cuidado": clasificacion_cuidado,
-        "clasificacion_envejecimiento": clasificacion_envejecimiento,
-        # Si necesitas el ID del archivo en Drive, agrégalo (asumimos que se envió en el JSON inicial)
-        # "id_archivo_drive": id_archivo_drive  
+        "clasificacion_envejecimiento": clasificacion_envejecimiento
     }
 
-
 # ------------------------------------------------------------
-# 12) Ejecutar con Uvicorn al correr directamente
+# 5) Arrancar con Uvicorn si se ejecuta directamente
 # ------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
