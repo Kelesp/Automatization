@@ -24,7 +24,10 @@ local.settings.json
 
 node_modules
 dist
+
+#ignorar log de servidor
 server.log
+
 
 # Local python packages
 .python_packages/
