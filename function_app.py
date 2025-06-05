@@ -115,7 +115,7 @@ async def process_pdf(
 
     # 3.3) Procesar en lotes para no exceder límite de tokens
     lista_parrafos = []
-    lote_size = 20  # Número de páginas por lote (puedes ajustar este valor)
+    lote_size = 50  # Número de páginas por lote (puedes ajustar este valor)
 
     for inicio in range(1, total_paginas + 1, lote_size):
         fin = min(inicio + lote_size - 1, total_paginas)
@@ -139,7 +139,7 @@ async def process_pdf(
         print(f"[DEBUG {now()}] Fragmento (páginas {inicio}-{fin}): {fragmento_debug!r}\n")
 
         # Cortar a un máximo de 20 000 caracteres para el prompt (para no pasarse de tokens)
-        texto_para_prompt = texto_lote[:20000]
+        texto_para_prompt = texto_lote[:25000]
 
         # Construir prompt de extracción de párrafos
         prompt_parrafos = f"""
