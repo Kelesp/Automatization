@@ -5,12 +5,12 @@ import json
 import tempfile
 import datetime
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 import pytesseract
 from PIL import Image
-import fitz   # PyMuPDF
+import fitz  # PyMuPDF
 
 import openai
 
@@ -36,8 +36,8 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise RuntimeError("No se encontró la variable de entorno OPENAI_API_KEY")
 
-# En Windows, ajuste la ruta de tesseract si es necesario:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Ajusta la ruta a tesseract si no está en el PATH (normalmente en Ubuntu es /usr/bin/tesseract)
+# pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 app = FastAPI(
     title="API de Extracción y Clasificación de Párrafos Relevantes",
@@ -115,7 +115,7 @@ async def process_pdf(
 
     # 3.3) Procesar en lotes para no exceder límite de tokens
     lista_parrafos = []
-    lote_size = 20  # Número de páginas por lote
+    lote_size = 20  # Número de páginas por lote (puedes ajustar este valor)
 
     for inicio in range(1, total_paginas + 1, lote_size):
         fin = min(inicio + lote_size - 1, total_paginas)
@@ -134,14 +134,14 @@ async def process_pdf(
         elapsed_lote = (datetime.datetime.now() - start_lote).total_seconds()
         print(f"[{now()}] ---- Texto extraído (Lote {inicio}-{fin}) en {round(elapsed_lote, 1)}s.")
 
-        # Debug: mostrar primeros caracteres
+        # Debug: mostrar primeros caracteres del texto
         fragmento_debug = texto_lote[:200] if texto_lote else ""
         print(f"[DEBUG {now()}] Fragmento (páginas {inicio}-{fin}): {fragmento_debug!r}\n")
 
-        # Cortar a un máximo de 20 000 caracteres para el prompt
+        # Cortar a un máximo de 20 000 caracteres para el prompt (para no pasarse de tokens)
         texto_para_prompt = texto_lote[:20000]
 
-        # Construir prompt más compacto para extracción de párrafos
+        # Construir prompt de extracción de párrafos
         prompt_parrafos = f"""
 Extrae únicamente los párrafos sobre alguno de estos temas (en español):
 • Personas mayores, Adulto mayor, Personas cuidadoras, Personas que requieren cuidado, Cuidadores, Sistema de cuidado, Caracterización de personas mayores, Caracterización de cuidadores.
@@ -331,10 +331,9 @@ Sin texto extra, sin explicaciones.
         "clasificacion_envejecimiento": clasificacion_envejecimiento,
     }
 
-
 # ────────────────────────────────────────────────────────────────────────────────
-# 4) Ejecutar con Uvicorn si se llama directamente
+# 4) Arrancar con Uvicorn si lo ejecutamos directamente
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("function_app:app", host="0.0.0.0", port=8002, workers=1)
+    uvicorn.run("function_app:app", host="0.0.0.0", port=8002, reload=True)
