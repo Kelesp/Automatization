@@ -2,183 +2,223 @@ import os
 import io
 import json
 import datetime
-import multiprocessing
 import logging
-import base64
-
-from celery import Celery, group, chord
-from celery.utils.log import get_task_logger
-import pytesseract
+import fitz
 from PIL import Image
-import fitz        # PyMuPDF
+import pytesseract
 import openai
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from celery import Celery
+from celery.utils.log import get_task_logger
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ─── Configuración Celery ──────────────────────────────────────────────────────
+# ─── Configuración de Celery ────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 celery_app = Celery("infovital", broker=REDIS_URL, backend=REDIS_URL)
-celery_app.conf.task_default_queue = "default"
+celery_app.conf.worker_prefetch_multiplier = 1
+
 logger = get_task_logger(__name__)
 logger.setLevel(logging.INFO)
-
-# ─── Configuración OpenAI ──────────────────────────────────────────────────────
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    raise RuntimeError("Falta la variable OPENAI_API_KEY")
-
-# ─── Constantes ────────────────────────────────────────────────────────────────
-MAX_POLICY_CHARS  = 15000
-MAX_SUMMARY_CHARS = 2000
 now = lambda: datetime.datetime.now().strftime("%H:%M:%S")
 
-# ─── Funciones de extracción y llamadas a OpenAI ──────────────────────────────
-def extract_page_text(page_idx: int, pdf_bytes: bytes) -> str:
+# ─── Configuración de OpenAI ────────────────────────────────────────────────────
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    raise RuntimeError("Falta OPENAI_API_KEY")
+
+# ─── Palabras clave ─────────────────────────────────────────────────────────────
+KEYWORDS = [
+    "Enfoque diferencial", "Personas mayores", "Adultos mayores", "Cuidadores",
+    "Sistemas de cuidado", "Caracterización poblacional",
+    "Caracterización de personas mayores", "Caracterización general de personas"
+]
+
+# ─── Objetivos oficiales ────────────────────────────────────────────────────────
+OBJ_PATH = os.getenv("RUTA_OBJETIVOS_JSON", "objetivos.json")
+if os.path.exists(OBJ_PATH):
+    with open(OBJ_PATH, "r", encoding="utf-8") as f:
+        POSSIBLE_OBJECTIVES = json.load(f)
+else:
+    POSSIBLE_OBJECTIVES = []
+
+# ─── Funciones de extracción ─────────────────────────────────────────────────────
+def extract_text_native(pdf_bytes: bytes, page_index: int) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = doc.load_page(page_index).get_text("text") or ""
+    doc.close()
+    return text.strip()
+
+def ocr_page(pdf_bytes: bytes, page_index: int) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pix = doc.load_page(page_index).get_pixmap(matrix=fitz.Matrix(2, 2))
+    doc.close()
+    img = Image.open(io.BytesIO(pix.tobytes()))
+    return pytesseract.image_to_string(img, lang="spa", config="--psm 4").strip()
+
+def extract_and_filter(args):
+    page_index, pdf_bytes = args
+    txt = extract_text_native(pdf_bytes, page_index)
+    if not txt:
+        txt = ocr_page(pdf_bytes, page_index)
+    lower = txt.lower()
+    for kw in KEYWORDS:
+        if kw.lower() in lower:
+            return {"pagina": page_index + 1, "parrafo": txt, "tema_detectado": kw}
+    return None
+
+# ─── OpenAI: análisis por párrafo en paralelo ───────────────────────────────────
+def process_parrafo(p):
+    bloque = f"{p['parrafo'][:3000]}"
+    tema = p['tema_detectado']
+    pagina = p['pagina']
+    prompt = f"""
+Del siguiente texto detectado en la página {pagina} con tema “{tema}”, genera:
+
+- "resumen": resumen del párrafo
+- "relevancia": alta, media o baja
+
+Devuélvelo en JSON como:
+{{
+  "pagina": {pagina},
+  "tema_detectado": "{tema}",
+  "parrafo": "...",
+  "resumen": "...",
+  "relevancia": "..."
+}}
+
+Texto:
+\"\"\"\n{bloque}\n\"\"\""""
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        page = doc.load_page(page_idx)
-        txt = page.get_text().strip()
-        doc.close()
-        if txt:
-            return txt
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        img = Image.open(io.BytesIO(pix.tobytes()))
-        return pytesseract.image_to_string(img, lang="spa", config="--psm 6").strip()
-    except Exception as e:
-        return f"[ERROR página {page_idx+1}: {e}]"
-
-def extract_text_batch(pdf_bytes: bytes, inicio: int, fin: int) -> str:
-    primero = inicio - 1
-    total   = fin - primero
-    resultados = [None] * total
-
-    def tarea(i):
-        resultados[i] = extract_page_text(primero + i, pdf_bytes)
-
-    workers = max(1, multiprocessing.cpu_count() - 1)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for i in range(total):
-            executor.submit(tarea, i)
-
-    return "\n".join(resultados)
-
-def call_openai_parrafos(texto: str) -> list:
-    prompt = f"Extrae párrafos relevantes:\n\"\"\"\n{texto[:25000]}\n\"\"\n"
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.0,
-        max_tokens=1500
-    )
-    content = resp.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = "\n".join(content.splitlines()[1:-1]).strip()
-    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=600,
+        )
+        content = resp.choices[0].message.content.strip()
         return json.loads(content)
-    except:
-        return [{"error":"No se pudo parsear JSON","raw":content}]
+    except Exception as e:
+        logger.warning(f"❌ Error OpenAI página {pagina}: {e}")
+        return None
 
+def parallel_openai_parrafos(relevantes):
+    with ThreadPoolExecutor(max_workers=4) as exe:
+        results = list(exe.map(process_parrafo, relevantes))
+    return [r for r in results if r]
+
+# ─── OpenAI: resumen general, alineación, objetivos ─────────────────────────────
 def call_openai_resumen(res_parc: list) -> str:
     bloque = "\n".join(f"- {r}" for r in res_parc if r)
-    prompt = f"A partir de estos resúmenes:\n{bloque}\n\nGenera un resumen general en 2–3 párrafos."
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content":
+            f"A partir de estos resúmenes:\n{bloque}\n\nGenera un resumen general en 2–3 párrafos."}],
         temperature=0.0,
-        max_tokens=1000
+        max_tokens=1000,
     )
     return resp.choices[0].message.content.strip()
 
-def call_openai_clasificacion(texto_politica: str, resumen: str) -> dict:
-    policy_excerpt  = texto_politica[:MAX_POLICY_CHARS]
-    summary_excerpt = resumen[:MAX_SUMMARY_CHARS]
-    prompt = (
-        f"Política (fragmento):\n\"\"\"\n{policy_excerpt}\n\"\"\"\n\n"
-        f"Resumen (fragmento):\n\"\"\"\n{summary_excerpt}\n\"\"\"\n\n"
-        "Devuelve un JSON con { \"alineacion\":\"alta|media|baja\","
-        " \"objetivos_alineados\":[...] }"
-    )
+def call_openai_clasificacion(resumen_general: str) -> str:
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content":
+            f"Resumen general:\n\"\"\"\n{resumen_general[:2000]}\n\"\"\"\n\n"
+            "Devuélveme solo uno de: alta, media o baja"}],
         temperature=0.0,
-        max_tokens=500
+        max_tokens=10,
     )
-    content = resp.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = "\n".join(content.splitlines()[1:-1]).strip()
+    return resp.choices[0].message.content.strip().lower()
+
+def call_openai_objetivos(resumen_general: str) -> list[str]:
+    posibles = "\n".join(f"- {o}" for o in POSSIBLE_OBJECTIVES)
+    prompt = f"""
+Dado este resumen general:
+\"\"\"\n{resumen_general[:2000]}\n\"\"\"\
+
+Y esta lista de objetivos de política:
+{posibles}
+
+Devuélveme JSON con los objetivos que aparecen en el resumen (array de strings). Si ninguno coincide, [].
+"""
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=300,
+    )
+    text = resp.choices[0].message.content.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.splitlines()[1:-1])
     try:
-        return json.loads(content)
+        return json.loads(text)
     except:
-        return {"error":"No se pudo parsear clasificación","raw":content}
+        return []
 
-# ─── Subtarea: procesa un lote de páginas ───────────────────────────────────────
-@celery_app.task(name="infovital.extract_batch")
-def extract_batch_task(pdf_bytes_b64: str, inicio: int, fin: int) -> list:
-    pdf_bytes = base64.b64decode(pdf_bytes_b64)
-    try:
-        texto = extract_text_batch(pdf_bytes, inicio, fin)
-        return call_openai_parrafos(texto)
-    except Exception as e:
-        logger.exception("Error en extract_batch_task")
-        return [{"error": str(e)}]
+# ─── Task principal ─────────────────────────────────────────────────────────────
+@celery_app.task(name="infovital.process_pdf", bind=True)
+def process_pdf_task(self, pdf_bytes, municipio: str, webhook_url: str):
+    import base64
+    if isinstance(pdf_bytes, str):
+        pdf_bytes = base64.b64decode(pdf_bytes)
 
-# ─── Callback final: resume, clasifica y notifica ───────────────────────────────
-@celery_app.task(name="infovital.finalize", bind=True)
-def finalize(self, results: list, pdf_bytes_b64: str, municipio: str, webhook_url: str):
     task_id = self.request.id
-    logger.info(f"[{now()}] finalize arrancó para task {task_id} con {len(results)} batches")
+    logger.info(f"[{now()}] process_pdf_task arrancó, task_id={task_id}")
 
-    # Aplana resultados
-    all_pars = [p for batch in results for p in (batch if isinstance(batch, list) else [])]
+    # total de páginas
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = doc.page_count
+    doc.close()
 
-    # Resumen general
-    res_parc = [p.get("resumen","") for p in all_pars if p.get("resumen")]
-    resumen_general = call_openai_resumen(res_parc) if res_parc else ""
+    # extracción y filtrado en paralelo
+    args = [(i, pdf_bytes) for i in range(total)]
+    relevantes = []
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as exe:
+        futures = {exe.submit(extract_and_filter, arg): arg[0] for arg in args}
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res: relevantes.append(res)
+            except Exception as e:
+                logger.warning(f"[hilo] página falló: {e}")
 
-    # Textos de políticas
-    ruta_cu = os.getenv("RUTA_TXT_CUIDADO", "")
-    ruta_ev = os.getenv("RUTA_TXT_ENVEJECIMIENTO", "")
-    text_cu = open(ruta_cu, "r", encoding="utf-8").read() if ruta_cu else ""
-    text_ev = open(ruta_ev, "r", encoding="utf-8").read() if ruta_ev else ""
+    # si no hay nada relevante
+    if not relevantes:
+        payload = {
+            "municipio": municipio,
+            "resumen_general": "",
+            "clasificacion_cuidado": {"alineacion": "", "objetivos_alineados": []},
+            "resultados_parrafos": [],
+            "link_al_archivo": ""
+        }
+        try:
+            r = requests.post(webhook_url, json=payload, timeout=30)
+            r.raise_for_status()
+            logger.info(f"[{now()}] Webhook OK (vacío) para task {task_id}")
+        except Exception as e:
+            logger.exception(f"Error webhook vacío para task {task_id}: {e}")
+        return
 
-    # Clasificaciones
-    clas_cu = call_openai_clasificacion(text_cu, resumen_general)
-    clas_ev = call_openai_clasificacion(text_ev, resumen_general)
+    # OpenAI: cada párrafo
+    parrafos = parallel_openai_parrafos(relevantes)
+    resumen_general = call_openai_resumen([p.get("resumen", "") for p in parrafos])
+    alineacion = call_openai_clasificacion(resumen_general)
+    objetivos = call_openai_objetivos(resumen_general)
 
+    # Payload final
     payload = {
-        "task_id": task_id,
         "municipio": municipio,
-        "total_parrafos": len(all_pars),
-        "resultados_parrafos": all_pars,
         "resumen_general": resumen_general,
-        "clasificacion_cuidado": clas_cu,
-        "clasificacion_envejecimiento": clas_ev,
+        "clasificacion_cuidado": {
+            "alineacion": alineacion,
+            "objetivos_alineados": objetivos
+        },
+        "resultados_parrafos": parrafos,
         "link_al_archivo": ""
     }
 
     try:
         r = requests.post(webhook_url, json=payload, timeout=30)
         r.raise_for_status()
-        logger.info(f"[{now()}] Webhook OK para {task_id}")
+        logger.info(f"[{now()}] Webhook OK para task {task_id}")
     except Exception as e:
-        logger.exception(f"Error al enviar webhook para {task_id}: {e}")
-
-# ─── Tarea maestra: divide en batches y dispara chord ───────────────────────────
-@celery_app.task(name="infovital.process_pdf", bind=True)
-def process_pdf_task(self, pdf_bytes_b64: str, municipio: str, webhook_url: str):
-    task_id = self.request.id
-    logger.info(f"[{now()}] process_pdf_task arrancó, task_id={task_id}")
-
-    pdf_bytes = base64.b64decode(pdf_bytes_b64)
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total = len(doc)
-    doc.close()
-
-    batches = [
-        extract_batch_task.s(pdf_bytes_b64, start, min(start+49, total))
-        for start in range(1, total+1, 50)
-    ]
-    chord(group(batches), finalize.s(pdf_bytes_b64, municipio, webhook_url)).delay()
-
-    logger.info(f"[{now()}] Chord lanzado con {len(batches)} jobs para task {task_id}")
+        logger.exception(f"Error webhook final para task {task_id}: {e}")
