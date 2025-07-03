@@ -75,7 +75,7 @@ def process_parrafo(p):
 Del siguiente texto detectado en la página {pagina} con tema “{tema}”, genera:
 
 - "resumen": resumen del párrafo
-- "relevancia": alta, media o baja
+- "relevancia": alta, media o baja, basándote en la importancia del tema con respecto a los objetivos de desarrollo social
 
 Devuélvelo en JSON como:
 {{
@@ -123,7 +123,7 @@ def call_openai_clasificacion(resumen_general: str) -> str:
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content":
             f"Resumen general:\n\"\"\"\n{resumen_general[:2000]}\n\"\"\"\n\n"
-            "Devuélveme solo uno de: alta, media o baja"}],
+            "Devuélveme solo uno de: alta, media o baja, basado en la alineación con los objetivos sociales de desarrollo."}],
         temperature=0.0,
         max_tokens=10,
     )
