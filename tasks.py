@@ -28,9 +28,9 @@ if not openai.api_key:
 
 # ─── Palabras clave ─────────────────────────────────────────────────────────────
 KEYWORDS = [
-    "Enfoque diferencial", "Personas mayores", "Adultos mayores", "Cuidadores",
-    "Sistemas de cuidado", "Caracterización poblacional",
-    "Caracterización de personas mayores", "Caracterización general de personas"
+    "Personas mayores", "Adultos mayores", "Cuidadores",
+    "Sistemas de cuidado", "Caracterización de cuidadores",
+    "Caracterización de personas mayores"      
 ]
 
 # ─── Objetivos oficiales ────────────────────────────────────────────────────────
